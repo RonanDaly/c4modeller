@@ -1,8 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 import math
-from heapq import heappop, heappush
-from itertools import count
 from pathlib import Path
 
 from PySide6.QtCore import QLineF, QMarginsF, QPointF, QRectF, Qt
@@ -98,6 +97,9 @@ ROUTE_OUTLET = 18.0
 ROUTE_BEND_PENALTY = 30.0
 ROUTE_PORT_SPACING = 34.0
 ROUTE_MAX_PORTS_PER_SIDE = 4
+ROUTE_MAX_ROUTE_PORTS = 5
+ROUTE_MAX_LANES = 4
+ROUTE_INDEX_CELL_SIZE = 240.0
 ROUTE_USED_SEGMENT_PENALTY = 900.0
 ROUTE_SHARED_PORT_PENALTY = 120.0
 
@@ -407,7 +409,7 @@ class RelationshipItem:
         relationship_id: str,
         label: str,
         obstacles: list[QRectF] | None = None,
-        occupied_segments: list[tuple[QPointF, QPointF]] | None = None,
+        occupied_segments: list[tuple[QPointF, QPointF]] | SegmentIndex | None = None,
         occupied_ports: list[QPointF] | None = None,
         use_fast_route: bool = False,
     ) -> None:
@@ -453,7 +455,7 @@ class RelationshipItem:
         source: ElementItem,
         target: ElementItem,
         obstacles: list[QRectF] | None = None,
-        occupied_segments: list[tuple[QPointF, QPointF]] | None = None,
+        occupied_segments: list[tuple[QPointF, QPointF]] | SegmentIndex | None = None,
         occupied_ports: list[QPointF] | None = None,
         use_fast_route: bool = False,
     ) -> None:
@@ -747,22 +749,35 @@ class MainWindow(QMainWindow):
         for relationship_item in self.relationship_items:
             relationship_item.remove_from_scene(self.scene)
         self.relationship_items = []
-        occupied_segments: list[tuple[QPointF, QPointF]] = []
+        occupied_segments = SegmentIndex()
         occupied_ports: list[QPointF] = []
-        for relationship in self.workspace.visible_relationships():
+        item_rects = {
+            element_id: item.mapRectToScene(item.rect())
+            for element_id, item in self.element_items.items()
+        }
+        ancestor_ids = {
+            element_id: {
+                ancestor.id
+                for ancestor in self.workspace.ancestors_of(element_id)
+            }
+            for element_id in self.element_items
+        }
+        visible_relationships = self.workspace.visible_relationships()
+        for relationship in visible_relationships:
             source = self.element_items.get(relationship.source_id)
             target = self.element_items.get(relationship.target_id)
             if not source or not target:
                 continue
+            excluded_ids = {
+                relationship.source_id,
+                relationship.target_id,
+                *ancestor_ids.get(relationship.source_id, set()),
+                *ancestor_ids.get(relationship.target_id, set()),
+            }
             obstacles = [
-                item.mapRectToScene(item.rect())
-                for element_id, item in self.element_items.items()
-                if element_id
-                in relationship_obstacle_ids(
-                    self.workspace,
-                    relationship.source_id,
-                    relationship.target_id,
-                )
+                rect
+                for element_id, rect in item_rects.items()
+                if element_id not in excluded_ids
             ]
             item = RelationshipItem(
                 source,
@@ -1616,11 +1631,176 @@ def relationship_obstacle_ids(
     }
 
 
+class KeepoutIndex:
+    def __init__(self, rects: list[QRectF]) -> None:
+        self.rects = rects
+        self.cells: dict[tuple[int, int], list[int]] = {}
+        self.segment_cross_cache: dict[tuple[float, float, float, float], bool] = {}
+        for index, rect in enumerate(rects):
+            left, right, top, bottom = self._cell_bounds(rect)
+            for cell_x in range(left, right + 1):
+                for cell_y in range(top, bottom + 1):
+                    self.cells.setdefault((cell_x, cell_y), []).append(index)
+
+    def contains_point(self, point: QPointF) -> bool:
+        return any(
+            rect.left() < point.x() < rect.right()
+            and rect.top() < point.y() < rect.bottom()
+            for rect in self._iter_rects_for_bounds(
+                point.x(),
+                point.x(),
+                point.y(),
+                point.y(),
+            )
+        )
+
+    def segment_crosses(self, start: tuple[float, float], end: tuple[float, float]) -> bool:
+        x1, y1 = start
+        x2, y2 = end
+        key = (
+            (x1, y1, x2, y2)
+            if (x1, y1) <= (x2, y2)
+            else (x2, y2, x1, y1)
+        )
+        if key in self.segment_cross_cache:
+            return self.segment_cross_cache[key]
+        crosses = any(
+            segment_crosses_rect(start, end, rect)
+            for rect in self._iter_rects_for_bounds(
+                min(x1, x2),
+                max(x1, x2),
+                min(y1, y2),
+                max(y1, y2),
+            )
+        )
+        self.segment_cross_cache[key] = crosses
+        return crosses
+
+    def _iter_rects_for_bounds(
+        self,
+        left: float,
+        right: float,
+        top: float,
+        bottom: float,
+    ) -> Iterator[QRectF]:
+        cell_left = self._cell_for(left)
+        cell_right = self._cell_for(right)
+        cell_top = self._cell_for(top)
+        cell_bottom = self._cell_for(bottom)
+        seen: set[int] = set()
+        for cell_x in range(cell_left, cell_right + 1):
+            for cell_y in range(cell_top, cell_bottom + 1):
+                for index in self.cells.get((cell_x, cell_y), []):
+                    if index in seen:
+                        continue
+                    seen.add(index)
+                    yield self.rects[index]
+
+    def _cell_bounds(self, rect: QRectF) -> tuple[int, int, int, int]:
+        return (
+            self._cell_for(rect.left()),
+            self._cell_for(rect.right()),
+            self._cell_for(rect.top()),
+            self._cell_for(rect.bottom()),
+        )
+
+    @staticmethod
+    def _cell_for(value: float) -> int:
+        return math.floor(value / ROUTE_INDEX_CELL_SIZE)
+
+
+class SegmentIndex:
+    def __init__(
+        self,
+        segments: list[tuple[QPointF, QPointF]] | None = None,
+    ) -> None:
+        self.segments: list[tuple[QPointF, QPointF]] = []
+        self.cells: dict[tuple[int, int], list[int]] = {}
+        self.overlap_cache: dict[tuple[float, float, float, float], float] = {}
+        self.extend(segments or [])
+
+    def extend(self, segments: list[tuple[QPointF, QPointF]]) -> None:
+        for start, end in segments:
+            self.add(start, end)
+
+    def add(self, start: QPointF, end: QPointF) -> None:
+        if start == end:
+            return
+        self.overlap_cache.clear()
+        index = len(self.segments)
+        self.segments.append((start, end))
+        left, right, top, bottom = self._cell_bounds(start, end)
+        for cell_x in range(left, right + 1):
+            for cell_y in range(top, bottom + 1):
+                self.cells.setdefault((cell_x, cell_y), []).append(index)
+
+    def overlap_penalty(
+        self,
+        start: tuple[float, float],
+        end: tuple[float, float],
+    ) -> float:
+        x1, y1 = start
+        x2, y2 = end
+        key = (
+            (x1, y1, x2, y2)
+            if (x1, y1) <= (x2, y2)
+            else (x2, y2, x1, y1)
+        )
+        if key in self.overlap_cache:
+            return self.overlap_cache[key]
+        penalty = 0.0
+        for occupied_start, occupied_end in self._segments_for_bounds(start, end):
+            overlap = segment_overlap_length(
+                start,
+                end,
+                (occupied_start.x(), occupied_start.y()),
+                (occupied_end.x(), occupied_end.y()),
+            )
+            if overlap:
+                penalty += ROUTE_USED_SEGMENT_PENALTY + overlap
+        self.overlap_cache[key] = penalty
+        return penalty
+
+    def _segments_for_bounds(
+        self,
+        start: tuple[float, float],
+        end: tuple[float, float],
+    ) -> list[tuple[QPointF, QPointF]]:
+        x1, y1 = start
+        x2, y2 = end
+        cell_left = self._cell_for(min(x1, x2))
+        cell_right = self._cell_for(max(x1, x2))
+        cell_top = self._cell_for(min(y1, y2))
+        cell_bottom = self._cell_for(max(y1, y2))
+        segments: list[tuple[QPointF, QPointF]] = []
+        seen: set[int] = set()
+        for cell_x in range(cell_left, cell_right + 1):
+            for cell_y in range(cell_top, cell_bottom + 1):
+                for index in self.cells.get((cell_x, cell_y), []):
+                    if index in seen:
+                        continue
+                    seen.add(index)
+                    segments.append(self.segments[index])
+        return segments
+
+    def _cell_bounds(self, start: QPointF, end: QPointF) -> tuple[int, int, int, int]:
+        return (
+            self._cell_for(min(start.x(), end.x())),
+            self._cell_for(max(start.x(), end.x())),
+            self._cell_for(min(start.y(), end.y())),
+            self._cell_for(max(start.y(), end.y())),
+        )
+
+    @staticmethod
+    def _cell_for(value: float) -> int:
+        return math.floor(value / ROUTE_INDEX_CELL_SIZE)
+
+
 def route_orthogonal_path(
     source: QRectF,
     target: QRectF,
     obstacles: list[QRectF],
-    occupied_segments: list[tuple[QPointF, QPointF]] | None = None,
+    occupied_segments: list[tuple[QPointF, QPointF]] | SegmentIndex | None = None,
     occupied_ports: list[QPointF] | None = None,
 ) -> list[QPointF] | None:
     occupied_segments = occupied_segments or []
@@ -1633,15 +1813,52 @@ def route_orthogonal_path(
         obstacle.adjusted(-ROUTE_MARGIN, -ROUTE_MARGIN, ROUTE_MARGIN, ROUTE_MARGIN)
         for obstacle in obstacles
     )
+    keepout_index = KeepoutIndex(keepouts)
+    source_ports = route_ports_for(source, target, keepout_index)
+    target_ports = route_ports_for(target, source, keepout_index)
+    best_path, best_score = best_route_for_port_pairs(
+        source_ports,
+        target_ports,
+        keepout_index,
+        occupied_segments,
+        occupied_ports,
+        allow_complex=False,
+    )
+    if best_path is not None and route_overlap_penalty(best_path, occupied_segments) == 0:
+        return best_path
+    complex_path, complex_score = best_route_for_port_pairs(
+        source_ports,
+        target_ports,
+        keepout_index,
+        occupied_segments,
+        occupied_ports,
+        allow_complex=True,
+    )
+    if best_path is None:
+        return complex_path
+    if complex_path is None or best_score <= complex_score:
+        return best_path
+    return complex_path
+
+
+def best_route_for_port_pairs(
+    source_ports: list[tuple[QPointF, QPointF]],
+    target_ports: list[tuple[QPointF, QPointF]],
+    keepouts: KeepoutIndex,
+    occupied_segments: list[tuple[QPointF, QPointF]] | SegmentIndex,
+    occupied_ports: list[QPointF],
+    allow_complex: bool,
+) -> tuple[list[QPointF] | None, float]:
     best_path: list[QPointF] | None = None
     best_score = math.inf
-    for source_anchor, source_outlet in candidate_ports_for(source):
-        for target_anchor, target_outlet in candidate_ports_for(target):
+    for source_anchor, source_outlet in source_ports:
+        for target_anchor, target_outlet in target_ports:
             routed = orthogonal_grid_route(
                 source_outlet,
                 target_outlet,
                 keepouts,
                 occupied_segments,
+                allow_complex=allow_complex,
             )
             if routed is None:
                 continue
@@ -1650,7 +1867,71 @@ def route_orthogonal_path(
             if score < best_score:
                 best_score = score
                 best_path = path
-    return best_path
+    return best_path, best_score
+
+
+def route_ports_for(
+    rect: QRectF,
+    other: QRectF,
+    keepouts: KeepoutIndex | None = None,
+) -> list[tuple[QPointF, QPointF]]:
+    other_center = other.center()
+    center = rect.center()
+
+    def port_score(port: tuple[QPointF, QPointF]) -> float:
+        anchor, outlet = port
+        outward = manhattan_distance(anchor, outlet)
+        side_bias = 0.0
+        if outlet.x() < anchor.x() and other_center.x() <= center.x():
+            side_bias -= 240.0
+        elif outlet.x() > anchor.x() and other_center.x() >= center.x():
+            side_bias -= 240.0
+        elif outlet.y() < anchor.y() and other_center.y() <= center.y():
+            side_bias -= 240.0
+        elif outlet.y() > anchor.y() and other_center.y() >= center.y():
+            side_bias -= 240.0
+        return manhattan_distance(anchor, other_center) + side_bias + outward * 0.01
+
+    ports = candidate_ports_for(rect)
+    if keepouts is not None:
+        routable_ports = [
+            port
+            for port in ports
+            if not keepouts.contains_point(port[1])
+        ]
+        if routable_ports:
+            ports = routable_ports
+
+    ranked_ports = sorted(ports, key=port_score)
+    selected: list[tuple[QPointF, QPointF]] = []
+
+    def add_port(port: tuple[QPointF, QPointF]) -> None:
+        if len(selected) >= ROUTE_MAX_ROUTE_PORTS:
+            return
+        if port not in selected:
+            selected.append(port)
+
+    for port in ranked_ports[:2]:
+        add_port(port)
+    for side in ("left", "right", "top", "bottom"):
+        for port in ranked_ports:
+            if port_side(port) == side:
+                add_port(port)
+                break
+    for port in ranked_ports:
+        add_port(port)
+    return selected
+
+
+def port_side(port: tuple[QPointF, QPointF]) -> str:
+    anchor, outlet = port
+    if outlet.x() < anchor.x():
+        return "left"
+    if outlet.x() > anchor.x():
+        return "right"
+    if outlet.y() < anchor.y():
+        return "top"
+    return "bottom"
 
 
 def candidate_ports_for(rect: QRectF) -> list[tuple[QPointF, QPointF]]:
@@ -1705,87 +1986,146 @@ def dedupe_ports(
 def orthogonal_grid_route(
     start: QPointF,
     end: QPointF,
-    keepouts: list[QRectF],
-    occupied_segments: list[tuple[QPointF, QPointF]] | None = None,
+    keepouts: KeepoutIndex,
+    occupied_segments: list[tuple[QPointF, QPointF]] | SegmentIndex | None = None,
+    allow_complex: bool = True,
 ) -> list[QPointF] | None:
     occupied_segments = occupied_segments or []
     if point_inside_any_keepout(start, keepouts) or point_inside_any_keepout(end, keepouts):
         return None
-    x_values = {start.x(), end.x()}
-    y_values = {start.y(), end.y()}
-    for rect in keepouts:
-        x_values.update([rect.left(), rect.right()])
-        y_values.update([rect.top(), rect.bottom()])
-    xs = sorted(x_values)
-    ys = sorted(y_values)
-    valid_nodes = {
-        (x, y)
-        for x in xs
-        for y in ys
-        if not point_inside_any_keepout(QPointF(x, y), keepouts)
-    }
-    start_key = (start.x(), start.y())
-    end_key = (end.x(), end.y())
-    valid_nodes.update([start_key, end_key])
-
-    distances: dict[tuple[tuple[float, float], str | None], float] = {
-        (start_key, None): 0.0
-    }
-    paths: dict[tuple[tuple[float, float], str | None], list[tuple[float, float]]] = {
-        (start_key, None): [start_key]
-    }
-    tie_breaker = count()
-    queue: list[tuple[float, int, tuple[float, float], str | None]] = [
-        (0.0, next(tie_breaker), start_key, None)
-    ]
-    while queue:
-        cost, _, node, previous_direction = heappop(queue)
-        state = (node, previous_direction)
-        if cost > distances.get(state, math.inf):
-            continue
-        if node == end_key:
-            return [QPointF(x, y) for x, y in simplify_point_keys(paths[state])]
-        for neighbour, direction in grid_neighbours(node, xs, ys, valid_nodes, keepouts):
-            move_cost = abs(neighbour[0] - node[0]) + abs(neighbour[1] - node[1])
-            bend_cost = (
-                ROUTE_BEND_PENALTY
-                if previous_direction and previous_direction != direction
-                else 0.0
-            )
-            overlap_cost = occupied_segment_penalty(node, neighbour, occupied_segments)
-            next_cost = cost + move_cost + bend_cost + overlap_cost
-            next_state = (neighbour, direction)
-            if next_cost >= distances.get(next_state, math.inf):
-                continue
-            distances[next_state] = next_cost
-            paths[next_state] = [*paths[state], neighbour]
-            heappush(queue, (next_cost, next(tie_breaker), neighbour, direction))
-    return None
+    x_lanes, y_lanes = route_lanes(start, end, keepouts.rects)
+    best_path, best_score = best_route_from_candidates(
+        simple_orthogonal_routes(start, end, x_lanes, y_lanes),
+        keepouts,
+        occupied_segments,
+    )
+    if (
+        not allow_complex
+        or (
+            best_path is not None
+            and route_overlap_penalty(best_path, occupied_segments) == 0
+        )
+    ):
+        return best_path
+    complex_path, complex_score = best_route_from_candidates(
+        complex_orthogonal_routes(start, end, x_lanes, y_lanes),
+        keepouts,
+        occupied_segments,
+    )
+    if best_path is None:
+        return complex_path
+    if complex_path is None or best_score <= complex_score:
+        return best_path
+    return complex_path
 
 
-def grid_neighbours(
-    node: tuple[float, float],
-    xs: list[float],
-    ys: list[float],
-    valid_nodes: set[tuple[float, float]],
+def candidate_orthogonal_routes(
+    start: QPointF,
+    end: QPointF,
     keepouts: list[QRectF],
-) -> list[tuple[tuple[float, float], str]]:
-    x, y = node
-    neighbours: list[tuple[tuple[float, float], str]] = []
-    x_index = xs.index(x)
-    y_index = ys.index(y)
-    for next_x in [xs[index] for index in [x_index - 1, x_index + 1] if 0 <= index < len(xs)]:
-        candidate = (next_x, y)
-        if candidate in valid_nodes and not segment_crosses_any_keepout(node, candidate, keepouts):
-            neighbours.append((candidate, "horizontal"))
-    for next_y in [ys[index] for index in [y_index - 1, y_index + 1] if 0 <= index < len(ys)]:
-        candidate = (x, next_y)
-        if candidate in valid_nodes and not segment_crosses_any_keepout(node, candidate, keepouts):
-            neighbours.append((candidate, "vertical"))
-    return neighbours
+) -> Iterator[list[QPointF]]:
+    x_lanes, y_lanes = route_lanes(start, end, keepouts)
+    yield from simple_orthogonal_routes(start, end, x_lanes, y_lanes)
+    yield from complex_orthogonal_routes(start, end, x_lanes, y_lanes)
 
 
-def point_inside_any_keepout(point: QPointF, keepouts: list[QRectF]) -> bool:
+def best_route_from_candidates(
+    candidates: Iterator[list[QPointF]],
+    keepouts: KeepoutIndex,
+    occupied_segments: list[tuple[QPointF, QPointF]] | SegmentIndex,
+) -> tuple[list[QPointF] | None, float]:
+    best_path: list[QPointF] | None = None
+    best_score = math.inf
+    for path in candidates:
+        if route_crosses_any_keepout(path, keepouts):
+            continue
+        score = route_score(path, occupied_segments)
+        if score < best_score:
+            best_score = score
+            best_path = path
+    return best_path, best_score
+
+
+def route_lanes(
+    start: QPointF,
+    end: QPointF,
+    keepouts: list[QRectF],
+) -> tuple[list[float], list[float]]:
+    x_lanes = lane_values(
+        [start.x(), end.x(), (start.x() + end.x()) / 2],
+        [rect.left() for rect in keepouts] + [rect.right() for rect in keepouts],
+        (start.x() + end.x()) / 2,
+    )
+    y_lanes = lane_values(
+        [start.y(), end.y(), (start.y() + end.y()) / 2],
+        [rect.top() for rect in keepouts] + [rect.bottom() for rect in keepouts],
+        (start.y() + end.y()) / 2,
+    )
+    return x_lanes, y_lanes
+
+
+def simple_orthogonal_routes(
+    start: QPointF,
+    end: QPointF,
+    x_lanes: list[float],
+    y_lanes: list[float],
+) -> Iterator[list[QPointF]]:
+    if start.x() == end.x() or start.y() == end.y():
+        yield simplify_path([start, end])
+    yield simplify_path([start, QPointF(end.x(), start.y()), end])
+    yield simplify_path([start, QPointF(start.x(), end.y()), end])
+    for x in x_lanes:
+        yield simplify_path([start, QPointF(x, start.y()), QPointF(x, end.y()), end])
+    for y in y_lanes:
+        yield simplify_path([start, QPointF(start.x(), y), QPointF(end.x(), y), end])
+
+
+def complex_orthogonal_routes(
+    start: QPointF,
+    end: QPointF,
+    x_lanes: list[float],
+    y_lanes: list[float],
+) -> Iterator[list[QPointF]]:
+    for x in x_lanes:
+        for y in y_lanes:
+            yield simplify_path(
+                [
+                    start,
+                    QPointF(x, start.y()),
+                    QPointF(x, y),
+                    QPointF(end.x(), y),
+                    end,
+                ]
+            )
+            yield simplify_path(
+                [
+                    start,
+                    QPointF(start.x(), y),
+                    QPointF(x, y),
+                    QPointF(x, end.y()),
+                    end,
+                ]
+            )
+
+
+def lane_values(
+    required: list[float],
+    candidates: list[float],
+    preferred: float,
+) -> list[float]:
+    unique = set(required)
+    ranked_candidates = sorted(set(candidates), key=lambda value: abs(value - preferred))
+    for candidate in ranked_candidates[:ROUTE_MAX_LANES]:
+        unique.add(candidate)
+    return sorted(unique)
+
+
+def point_inside_any_keepout(
+    point: QPointF,
+    keepouts: list[QRectF] | KeepoutIndex,
+) -> bool:
+    if isinstance(keepouts, KeepoutIndex):
+        return keepouts.contains_point(point)
     return any(
         rect.left() < point.x() < rect.right()
         and rect.top() < point.y() < rect.bottom()
@@ -1796,9 +2136,25 @@ def point_inside_any_keepout(point: QPointF, keepouts: list[QRectF]) -> bool:
 def segment_crosses_any_keepout(
     start: tuple[float, float],
     end: tuple[float, float],
-    keepouts: list[QRectF],
+    keepouts: list[QRectF] | KeepoutIndex,
 ) -> bool:
+    if isinstance(keepouts, KeepoutIndex):
+        return keepouts.segment_crosses(start, end)
     return any(segment_crosses_rect(start, end, rect) for rect in keepouts)
+
+
+def route_crosses_any_keepout(
+    points: list[QPointF],
+    keepouts: list[QRectF] | KeepoutIndex,
+) -> bool:
+    return any(
+        segment_crosses_any_keepout(
+            (start.x(), start.y()),
+            (end.x(), end.y()),
+            keepouts,
+        )
+        for start, end in zip(points, points[1:])
+    )
 
 
 def segment_crosses_rect(
@@ -1824,8 +2180,10 @@ def segment_crosses_rect(
 def occupied_segment_penalty(
     start: tuple[float, float],
     end: tuple[float, float],
-    occupied_segments: list[tuple[QPointF, QPointF]],
+    occupied_segments: list[tuple[QPointF, QPointF]] | SegmentIndex,
 ) -> float:
+    if isinstance(occupied_segments, SegmentIndex):
+        return occupied_segments.overlap_penalty(start, end)
     penalty = 0.0
     for occupied_start, occupied_end in occupied_segments:
         overlap = segment_overlap_length(
@@ -1918,7 +2276,7 @@ def simplify_point_keys(points: list[tuple[float, float]]) -> list[tuple[float, 
 
 def route_score(
     points: list[QPointF],
-    occupied_segments: list[tuple[QPointF, QPointF]] | None = None,
+    occupied_segments: list[tuple[QPointF, QPointF]] | SegmentIndex | None = None,
     occupied_ports: list[QPointF] | None = None,
 ) -> float:
     occupied_segments = occupied_segments or []
@@ -1948,6 +2306,20 @@ def route_score(
         )
     )
     return length + bends * ROUTE_BEND_PENALTY + overlap_penalty + port_penalty
+
+
+def route_overlap_penalty(
+    points: list[QPointF],
+    occupied_segments: list[tuple[QPointF, QPointF]] | SegmentIndex,
+) -> float:
+    return sum(
+        occupied_segment_penalty(
+            (start.x(), start.y()),
+            (end.x(), end.y()),
+            occupied_segments,
+        )
+        for start, end in zip(points, points[1:])
+    )
 
 
 def manhattan_distance(first: QPointF, second: QPointF) -> float:
