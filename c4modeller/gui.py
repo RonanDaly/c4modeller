@@ -96,6 +96,10 @@ CONTAINMENT_TOP_MARGIN = 54.0
 ROUTE_MARGIN = 24.0
 ROUTE_OUTLET = 18.0
 ROUTE_BEND_PENALTY = 30.0
+ROUTE_PORT_SPACING = 34.0
+ROUTE_MAX_PORTS_PER_SIDE = 4
+ROUTE_USED_SEGMENT_PENALTY = 900.0
+ROUTE_SHARED_PORT_PENALTY = 120.0
 
 
 class ElementItem(QGraphicsRectItem):
@@ -118,6 +122,7 @@ class ElementItem(QGraphicsRectItem):
         self.layout = layout
         self.main_window = main_window
         self.resizing = False
+        self.dragging = False
         self.setPos(layout.x, layout.y)
         color = TYPE_COLORS[element.type]
         if self.is_filled_box():
@@ -207,12 +212,14 @@ class ElementItem(QGraphicsRectItem):
                 and (delta.x() or delta.y())
             ):
                 self.main_window.move_descendants(self.element.id, delta)
-            self.main_window.refresh_edges()
+            if not self.main_window.syncing_layout:
+                self.main_window.refresh_edges()
         return super().itemChange(change, value)
 
     def mousePressEvent(self, event) -> None:
         if self.can_resize() and self._handle_rect().contains(event.pos()):
             self.resizing = True
+            self.main_window.live_routing = True
             event.accept()
             return
         if self.main_window.connect_mode:
@@ -223,6 +230,8 @@ class ElementItem(QGraphicsRectItem):
             self.main_window.handle_move_click(self.element.id)
             event.accept()
             return
+        self.dragging = True
+        self.main_window.live_routing = True
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
@@ -236,7 +245,7 @@ class ElementItem(QGraphicsRectItem):
             self.setRect(0, 0, width, height)
             self.main_window.set_visible_size_for(self.element.id, width, height)
             self._position_labels()
-            self.main_window.refresh_edges()
+            self.main_window.refresh_edges(fast=True)
             event.accept()
             return
         super().mouseMoveEvent(event)
@@ -244,9 +253,16 @@ class ElementItem(QGraphicsRectItem):
     def mouseReleaseEvent(self, event) -> None:
         if self.resizing:
             self.resizing = False
+            self.main_window.live_routing = False
+            self.main_window.refresh_edges(fast=False)
             event.accept()
             return
+        was_dragging = self.dragging
+        self.dragging = False
         super().mouseReleaseEvent(event)
+        if was_dragging:
+            self.main_window.live_routing = False
+            self.main_window.refresh_edges(fast=False)
 
     def hoverMoveEvent(self, event) -> None:
         if self.can_resize() and self._handle_rect().contains(event.pos()):
@@ -391,8 +407,12 @@ class RelationshipItem:
         relationship_id: str,
         label: str,
         obstacles: list[QRectF] | None = None,
+        occupied_segments: list[tuple[QPointF, QPointF]] | None = None,
+        occupied_ports: list[QPointF] | None = None,
+        use_fast_route: bool = False,
     ) -> None:
         self.relationship_id = relationship_id
+        self.route_points: list[QPointF] = []
         self.path_item = RelationshipPathItem()
         self.path_item.setPen(QPen(QColor("#37474f"), 2, Qt.SolidLine, Qt.RoundCap))
         self.path_item.setZValue(1)
@@ -408,7 +428,14 @@ class RelationshipItem:
             item.setFlag(QGraphicsItem.ItemIsSelectable, True)
             item.setData(0, "relationship")
             item.setData(1, relationship_id)
-        self.update(source, target, obstacles or [])
+        self.update(
+            source,
+            target,
+            obstacles or [],
+            occupied_segments or [],
+            occupied_ports or [],
+            use_fast_route,
+        )
 
     def add_to_scene(self, scene: QGraphicsScene) -> None:
         scene.addItem(self.path_item)
@@ -426,12 +453,24 @@ class RelationshipItem:
         source: ElementItem,
         target: ElementItem,
         obstacles: list[QRectF] | None = None,
+        occupied_segments: list[tuple[QPointF, QPointF]] | None = None,
+        occupied_ports: list[QPointF] | None = None,
+        use_fast_route: bool = False,
     ) -> None:
         source_rect = source.mapRectToScene(source.rect())
         target_rect = target.mapRectToScene(target.rect())
-        points = route_orthogonal_path(source_rect, target_rect, obstacles or [])
+        points = None
+        if not use_fast_route:
+            points = route_orthogonal_path(
+                source_rect,
+                target_rect,
+                obstacles or [],
+                occupied_segments or [],
+                occupied_ports or [],
+            )
         if points is None:
             points = fallback_route_points(source_rect, target_rect)
+        self.route_points = points
         end = points[-1]
         path = QPainterPath(points[0])
         for point in points[1:]:
@@ -675,6 +714,7 @@ class MainWindow(QMainWindow):
         self.move_action: QAction | None = None
         self.syncing_layout = False
         self.syncing_model_tree = False
+        self.live_routing = False
         self._build_toolbar()
         self._seed_example()
         self.refresh_scene()
@@ -701,10 +741,14 @@ class MainWindow(QMainWindow):
         self.refresh_edges()
         self._update_title()
 
-    def refresh_edges(self) -> None:
+    def refresh_edges(self, fast: bool | None = None) -> None:
+        if fast is None:
+            fast = self.live_routing
         for relationship_item in self.relationship_items:
             relationship_item.remove_from_scene(self.scene)
         self.relationship_items = []
+        occupied_segments: list[tuple[QPointF, QPointF]] = []
+        occupied_ports: list[QPointF] = []
         for relationship in self.workspace.visible_relationships():
             source = self.element_items.get(relationship.source_id)
             target = self.element_items.get(relationship.target_id)
@@ -726,9 +770,15 @@ class MainWindow(QMainWindow):
                 relationship.id,
                 relationship.description,
                 obstacles,
+                occupied_segments,
+                occupied_ports,
+                use_fast_route=fast,
             )
             item.add_to_scene(self.scene)
             self.relationship_items.append(item)
+            occupied_segments.extend(path_segments(item.route_points))
+            if item.route_points:
+                occupied_ports.extend([item.route_points[0], item.route_points[-1]])
 
     def handle_connect_click(self, element_id: str) -> None:
         if self.connect_source_id is None:
@@ -1570,7 +1620,11 @@ def route_orthogonal_path(
     source: QRectF,
     target: QRectF,
     obstacles: list[QRectF],
+    occupied_segments: list[tuple[QPointF, QPointF]] | None = None,
+    occupied_ports: list[QPointF] | None = None,
 ) -> list[QPointF] | None:
+    occupied_segments = occupied_segments or []
+    occupied_ports = occupied_ports or []
     keepouts = [
         source.adjusted(-1, -1, 1, 1),
         target.adjusted(-1, -1, 1, 1),
@@ -1581,43 +1635,80 @@ def route_orthogonal_path(
     )
     best_path: list[QPointF] | None = None
     best_score = math.inf
-    for source_side in ["left", "right", "top", "bottom"]:
-        source_anchor, source_outlet = side_anchor_and_outlet(source, source_side)
-        for target_side in ["left", "right", "top", "bottom"]:
-            target_anchor, target_outlet = side_anchor_and_outlet(target, target_side)
-            routed = orthogonal_grid_route(source_outlet, target_outlet, keepouts)
+    for source_anchor, source_outlet in candidate_ports_for(source):
+        for target_anchor, target_outlet in candidate_ports_for(target):
+            routed = orthogonal_grid_route(
+                source_outlet,
+                target_outlet,
+                keepouts,
+                occupied_segments,
+            )
             if routed is None:
                 continue
             path = simplify_path([source_anchor, *routed, target_anchor])
-            score = route_score(path)
+            score = route_score(path, occupied_segments, occupied_ports)
             if score < best_score:
                 best_score = score
                 best_path = path
     return best_path
 
 
-def side_anchor_and_outlet(rect: QRectF, side: str) -> tuple[QPointF, QPointF]:
-    center = rect.center()
-    if side == "left":
-        anchor = QPointF(rect.left(), center.y())
-        outlet = QPointF(rect.left() - ROUTE_OUTLET, center.y())
-    elif side == "right":
-        anchor = QPointF(rect.right(), center.y())
-        outlet = QPointF(rect.right() + ROUTE_OUTLET, center.y())
-    elif side == "top":
-        anchor = QPointF(center.x(), rect.top())
-        outlet = QPointF(center.x(), rect.top() - ROUTE_OUTLET)
-    else:
-        anchor = QPointF(center.x(), rect.bottom())
-        outlet = QPointF(center.x(), rect.bottom() + ROUTE_OUTLET)
-    return anchor, outlet
+def candidate_ports_for(rect: QRectF) -> list[tuple[QPointF, QPointF]]:
+    ports: list[tuple[QPointF, QPointF]] = []
+    for y in port_positions(rect.top(), rect.bottom()):
+        ports.append((
+            QPointF(rect.left(), y),
+            QPointF(rect.left() - ROUTE_OUTLET, y),
+        ))
+        ports.append((
+            QPointF(rect.right(), y),
+            QPointF(rect.right() + ROUTE_OUTLET, y),
+        ))
+    for x in port_positions(rect.left(), rect.right()):
+        ports.append((
+            QPointF(x, rect.top()),
+            QPointF(x, rect.top() - ROUTE_OUTLET),
+        ))
+        ports.append((
+            QPointF(x, rect.bottom()),
+            QPointF(x, rect.bottom() + ROUTE_OUTLET),
+        ))
+    return dedupe_ports(ports)
+
+
+def port_positions(start: float, end: float) -> list[float]:
+    length = max(0.0, end - start)
+    if length <= ROUTE_PORT_SPACING:
+        return [(start + end) / 2]
+    count = min(
+        ROUTE_MAX_PORTS_PER_SIDE,
+        max(2, int(length // ROUTE_PORT_SPACING) + 1),
+    )
+    gap = length / (count + 1)
+    return [start + gap * index for index in range(1, count + 1)]
+
+
+def dedupe_ports(
+    ports: list[tuple[QPointF, QPointF]],
+) -> list[tuple[QPointF, QPointF]]:
+    seen: set[tuple[float, float, float, float]] = set()
+    deduped: list[tuple[QPointF, QPointF]] = []
+    for anchor, outlet in ports:
+        key = (anchor.x(), anchor.y(), outlet.x(), outlet.y())
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append((anchor, outlet))
+    return deduped
 
 
 def orthogonal_grid_route(
     start: QPointF,
     end: QPointF,
     keepouts: list[QRectF],
+    occupied_segments: list[tuple[QPointF, QPointF]] | None = None,
 ) -> list[QPointF] | None:
+    occupied_segments = occupied_segments or []
     if point_inside_any_keepout(start, keepouts) or point_inside_any_keepout(end, keepouts):
         return None
     x_values = {start.x(), end.x()}
@@ -1661,7 +1752,8 @@ def orthogonal_grid_route(
                 if previous_direction and previous_direction != direction
                 else 0.0
             )
-            next_cost = cost + move_cost + bend_cost
+            overlap_cost = occupied_segment_penalty(node, neighbour, occupied_segments)
+            next_cost = cost + move_cost + bend_cost + overlap_cost
             next_state = (neighbour, direction)
             if next_cost >= distances.get(next_state, math.inf):
                 continue
@@ -1729,6 +1821,53 @@ def segment_crosses_rect(
     return False
 
 
+def occupied_segment_penalty(
+    start: tuple[float, float],
+    end: tuple[float, float],
+    occupied_segments: list[tuple[QPointF, QPointF]],
+) -> float:
+    penalty = 0.0
+    for occupied_start, occupied_end in occupied_segments:
+        overlap = segment_overlap_length(
+            start,
+            end,
+            (occupied_start.x(), occupied_start.y()),
+            (occupied_end.x(), occupied_end.y()),
+        )
+        if overlap:
+            penalty += ROUTE_USED_SEGMENT_PENALTY + overlap
+    return penalty
+
+
+def segment_overlap_length(
+    first_start: tuple[float, float],
+    first_end: tuple[float, float],
+    second_start: tuple[float, float],
+    second_end: tuple[float, float],
+) -> float:
+    x1, y1 = first_start
+    x2, y2 = first_end
+    x3, y3 = second_start
+    x4, y4 = second_end
+    if y1 == y2 == y3 == y4:
+        left = max(min(x1, x2), min(x3, x4))
+        right = min(max(x1, x2), max(x3, x4))
+        return max(0.0, right - left)
+    if x1 == x2 == x3 == x4:
+        top = max(min(y1, y2), min(y3, y4))
+        bottom = min(max(y1, y2), max(y3, y4))
+        return max(0.0, bottom - top)
+    return 0.0
+
+
+def path_segments(points: list[QPointF]) -> list[tuple[QPointF, QPointF]]:
+    return [
+        (start, end)
+        for start, end in zip(points, points[1:])
+        if start != end
+    ]
+
+
 def fallback_route_points(source: QRectF, target: QRectF) -> list[QPointF]:
     start, end, orientation = connection_points(source, target)
     if orientation == "horizontal":
@@ -1777,9 +1916,16 @@ def simplify_point_keys(points: list[tuple[float, float]]) -> list[tuple[float, 
     return simplified
 
 
-def route_score(points: list[QPointF]) -> float:
+def route_score(
+    points: list[QPointF],
+    occupied_segments: list[tuple[QPointF, QPointF]] | None = None,
+    occupied_ports: list[QPointF] | None = None,
+) -> float:
+    occupied_segments = occupied_segments or []
+    occupied_ports = occupied_ports or []
     length = 0.0
     bends = 0
+    overlap_penalty = 0.0
     previous_direction: str | None = None
     for start, end in zip(points, points[1:]):
         length += abs(end.x() - start.x()) + abs(end.y() - start.y())
@@ -1787,7 +1933,25 @@ def route_score(points: list[QPointF]) -> float:
         if previous_direction and previous_direction != direction:
             bends += 1
         previous_direction = direction
-    return length + bends * ROUTE_BEND_PENALTY
+        overlap_penalty += occupied_segment_penalty(
+            (start.x(), start.y()),
+            (end.x(), end.y()),
+            occupied_segments,
+        )
+    port_penalty = sum(
+        ROUTE_SHARED_PORT_PENALTY
+        for port in occupied_ports
+        if points
+        and (
+            manhattan_distance(points[0], port) <= ROUTE_PORT_SPACING / 2
+            or manhattan_distance(points[-1], port) <= ROUTE_PORT_SPACING / 2
+        )
+    )
+    return length + bends * ROUTE_BEND_PENALTY + overlap_penalty + port_penalty
+
+
+def manhattan_distance(first: QPointF, second: QPointF) -> float:
+    return abs(first.x() - second.x()) + abs(first.y() - second.y())
 
 
 def label_position_for_path(points: list[QPointF]) -> QPointF:
