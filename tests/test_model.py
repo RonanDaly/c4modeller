@@ -38,6 +38,34 @@ class WorkspaceVisibilityTests(unittest.TestCase):
 
         self.assertEqual(workspace.visible_relationships(), [])
 
+    def test_unchecked_elements_are_hidden_in_the_active_view(self) -> None:
+        workspace = Workspace()
+        system = workspace.add_element("Payments", ElementType.SOFTWARE_SYSTEM)
+        api = workspace.add_element("API", ElementType.CONTAINER, parent_id=system.id)
+        database = workspace.add_element("DB", ElementType.CONTAINER, parent_id=system.id)
+        worker = workspace.add_element("Worker", ElementType.COMPONENT, parent_id=api.id)
+
+        workspace.set_expanded(system.id, True)
+        workspace.set_expanded(api.id, True)
+        workspace.add_relationship(worker.id, database.id, "writes to")
+
+        workspace.set_element_checked(worker.id, False)
+
+        self.assertNotIn(worker.id, {element.id for element in workspace.visible_elements()})
+        self.assertEqual(workspace.visible_relationships(), [])
+
+    def test_unchecked_parent_hides_checked_descendants(self) -> None:
+        workspace = Workspace()
+        system = workspace.add_element("Payments", ElementType.SOFTWARE_SYSTEM)
+        api = workspace.add_element("API", ElementType.CONTAINER, parent_id=system.id)
+
+        workspace.set_expanded(system.id, True)
+        workspace.set_element_checked(system.id, False)
+
+        self.assertTrue(workspace.is_element_checked(api.id))
+        self.assertNotIn(system.id, {element.id for element in workspace.visible_elements()})
+        self.assertNotIn(api.id, {element.id for element in workspace.visible_elements()})
+
     def test_json_round_trip_preserves_layout_and_view_state(self) -> None:
         workspace = Workspace(name="Example")
         system = workspace.add_element(
@@ -48,6 +76,8 @@ class WorkspaceVisibilityTests(unittest.TestCase):
             description="Handles payment flows",
         )
         workspace.set_expanded(system.id, False)
+        workspace.set_element_checked(system.id, False)
+        workspace.set_tree_expanded(system.id, False)
 
         restored = Workspace.from_json(workspace.to_json())
 
@@ -59,6 +89,8 @@ class WorkspaceVisibilityTests(unittest.TestCase):
         )
         self.assertEqual(restored.layout_for(system.id).x, 100)
         self.assertFalse(restored.is_expanded(system.id))
+        self.assertFalse(restored.is_element_checked(system.id))
+        self.assertFalse(restored.is_tree_expanded(system.id))
 
     def test_copy_active_model_creates_independent_model(self) -> None:
         workspace = Workspace(name="Example")
@@ -349,6 +381,25 @@ class WorkspaceVisibilityTests(unittest.TestCase):
 
         workspace.set_active_view(workspace.diagram.views[1].id)
         self.assertTrue(workspace.is_expanded(api.id))
+
+    def test_views_have_separate_element_visibility_and_tree_state(self) -> None:
+        workspace = Workspace()
+        system = workspace.add_element("Payments", ElementType.SOFTWARE_SYSTEM)
+        first_view_id = workspace.active_view().id
+
+        workspace.set_element_checked(system.id, False)
+        workspace.set_tree_expanded(system.id, False)
+        workspace.add_view("Other")
+        workspace.set_element_checked(system.id, True)
+        workspace.set_tree_expanded(system.id, True)
+
+        workspace.set_active_view(first_view_id)
+        self.assertFalse(workspace.is_element_checked(system.id))
+        self.assertFalse(workspace.is_tree_expanded(system.id))
+
+        workspace.set_active_view(workspace.diagram.views[1].id)
+        self.assertTrue(workspace.is_element_checked(system.id))
+        self.assertTrue(workspace.is_tree_expanded(system.id))
 
     def test_collapsed_sizes_are_view_specific(self) -> None:
         workspace = Workspace()

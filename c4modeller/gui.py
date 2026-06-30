@@ -35,9 +35,12 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QSplitter,
     QTabBar,
     QTextEdit,
     QToolBar,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -636,13 +639,24 @@ class MainWindow(QMainWindow):
         self.tabs = QTabBar(self)
         self.tabs.setExpanding(False)
         self.tabs.currentChanged.connect(self.switch_view)
+        self.model_tree = QTreeWidget(self)
+        self.model_tree.setHeaderLabel("Model Elements")
+        self.model_tree.setMinimumWidth(260)
+        self.model_tree.itemChanged.connect(self.handle_model_tree_item_changed)
+        self.model_tree.itemExpanded.connect(self.handle_model_tree_item_expanded)
+        self.model_tree.itemCollapsed.connect(self.handle_model_tree_item_collapsed)
+        splitter = QSplitter(Qt.Horizontal, self)
+        splitter.addWidget(self.model_tree)
+        splitter.addWidget(self.view)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
         central = QWidget(self)
         layout = QVBoxLayout(central)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         layout.addWidget(self.model_tabs)
         layout.addWidget(self.tabs)
-        layout.addWidget(self.view)
+        layout.addWidget(splitter)
         self.setCentralWidget(central)
         self.element_items: dict[str, ElementItem] = {}
         self.relationship_items: list[RelationshipItem] = []
@@ -653,6 +667,7 @@ class MainWindow(QMainWindow):
         self.move_source_id: str | None = None
         self.move_action: QAction | None = None
         self.syncing_layout = False
+        self.syncing_model_tree = False
         self._build_toolbar()
         self._seed_example()
         self.refresh_scene()
@@ -661,6 +676,7 @@ class MainWindow(QMainWindow):
         self.enforce_containment()
         self.refresh_model_tabs()
         self.refresh_tabs()
+        self.refresh_model_tree()
         self.scene.clear()
         self.element_items.clear()
         self.relationship_items.clear()
@@ -1062,6 +1078,79 @@ class MainWindow(QMainWindow):
         self.refresh_scene()
         self.statusBar().showMessage(f"Copied model to {copied.name}", 3000)
 
+    def refresh_model_tree(self) -> None:
+        self.syncing_model_tree = True
+        self.model_tree.blockSignals(True)
+        try:
+            self.model_tree.clear()
+            for element in self._sorted_children(None):
+                self._add_model_tree_item(None, element)
+        finally:
+            self.model_tree.blockSignals(False)
+            self.syncing_model_tree = False
+
+    def _add_model_tree_item(
+        self,
+        parent_item: QTreeWidgetItem | None,
+        element: C4Element,
+    ) -> QTreeWidgetItem:
+        item = QTreeWidgetItem(parent_item or self.model_tree)
+        item.setText(0, tree_text_for(element))
+        item.setData(0, Qt.UserRole, element.id)
+        item.setFlags(
+            item.flags()
+            | Qt.ItemIsUserCheckable
+            | Qt.ItemIsEnabled
+            | Qt.ItemIsSelectable
+        )
+        item.setCheckState(
+            0,
+            Qt.Checked if self.workspace.is_element_checked(element.id) else Qt.Unchecked,
+        )
+        for child in self._sorted_children(element.id):
+            self._add_model_tree_item(item, child)
+        item.setExpanded(self.workspace.is_tree_expanded(element.id))
+        return item
+
+    def _sorted_children(self, parent_id: str | None) -> list[C4Element]:
+        return sorted(
+            self.workspace.children_of(parent_id),
+            key=lambda element: (element.name.lower(), element.type.value),
+        )
+
+    def handle_model_tree_item_changed(
+        self,
+        item: QTreeWidgetItem,
+        column: int,
+    ) -> None:
+        if self.syncing_model_tree or column != 0:
+            return
+        element_id = item.data(0, Qt.UserRole)
+        if not element_id:
+            return
+        self.workspace.set_element_checked(
+            element_id,
+            item.checkState(0) == Qt.Checked,
+        )
+        self.refresh_scene()
+
+    def handle_model_tree_item_expanded(self, item: QTreeWidgetItem) -> None:
+        self._set_model_tree_item_expanded(item, True)
+
+    def handle_model_tree_item_collapsed(self, item: QTreeWidgetItem) -> None:
+        self._set_model_tree_item_expanded(item, False)
+
+    def _set_model_tree_item_expanded(
+        self,
+        item: QTreeWidgetItem,
+        expanded: bool,
+    ) -> None:
+        if self.syncing_model_tree:
+            return
+        element_id = item.data(0, Qt.UserRole)
+        if element_id:
+            self.workspace.set_tree_expanded(element_id, expanded)
+
     def refresh_tabs(self) -> None:
         self.tabs.blockSignals(True)
         try:
@@ -1434,3 +1523,7 @@ def subtitle_text_for(element: C4Element) -> str:
     if element.type in SUBTYPE_TYPES and element.subtype:
         text += f": {element.subtype}"
     return f"[{text}]"
+
+
+def tree_text_for(element: C4Element) -> str:
+    return f"{element.name} {subtitle_text_for(element)}"

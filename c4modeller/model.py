@@ -175,6 +175,8 @@ class ViewState:
     name: str
     expanded: dict[str, bool] = field(default_factory=dict)
     collapsed_sizes: dict[str, dict[str, float]] = field(default_factory=dict)
+    visible: dict[str, bool] = field(default_factory=dict)
+    tree_expanded: dict[str, bool] = field(default_factory=dict)
 
     @classmethod
     def create(
@@ -182,6 +184,8 @@ class ViewState:
         name: str,
         expanded: dict[str, bool] | None = None,
         collapsed_sizes: dict[str, dict[str, float]] | None = None,
+        visible: dict[str, bool] | None = None,
+        tree_expanded: dict[str, bool] | None = None,
     ) -> ViewState:
         return cls(
             id=f"view_{uuid4().hex[:12]}",
@@ -191,6 +195,8 @@ class ViewState:
                 element_id: dict(size)
                 for element_id, size in (collapsed_sizes or {}).items()
             },
+            visible=dict(visible or {}),
+            tree_expanded=dict(tree_expanded or {}),
         )
 
     def is_expanded(self, element_id: str) -> bool:
@@ -202,6 +208,20 @@ class ViewState:
     def remove_element(self, element_id: str) -> None:
         self.expanded.pop(element_id, None)
         self.collapsed_sizes.pop(element_id, None)
+        self.visible.pop(element_id, None)
+        self.tree_expanded.pop(element_id, None)
+
+    def is_element_visible(self, element_id: str) -> bool:
+        return self.visible.get(element_id, True)
+
+    def set_element_visible(self, element_id: str, visible: bool) -> None:
+        self.visible[element_id] = visible
+
+    def is_tree_expanded(self, element_id: str) -> bool:
+        return self.tree_expanded.get(element_id, True)
+
+    def set_tree_expanded(self, element_id: str, expanded: bool) -> None:
+        self.tree_expanded[element_id] = expanded
 
     def collapsed_size_for(self, element_id: str) -> tuple[float, float] | None:
         size = self.collapsed_sizes.get(element_id)
@@ -221,6 +241,8 @@ class ViewState:
             "name": self.name,
             "expanded": self.expanded,
             "collapsed_sizes": self.collapsed_sizes,
+            "visible": self.visible,
+            "tree_expanded": self.tree_expanded,
         }
 
     @classmethod
@@ -238,6 +260,14 @@ class ViewState:
                     "height": float(size.get("height", 0)),
                 }
                 for element_id, size in data.get("collapsed_sizes", {}).items()
+            },
+            visible={
+                element_id: bool(visible)
+                for element_id, visible in data.get("visible", {}).items()
+            },
+            tree_expanded={
+                element_id: bool(expanded)
+                for element_id, expanded in data.get("tree_expanded", {}).items()
             },
         )
 
@@ -285,10 +315,14 @@ class DiagramState:
         current = self.current_view()
         expanded = current.expanded if copy_from_active else {}
         collapsed_sizes = current.collapsed_sizes if copy_from_active else {}
+        visible = current.visible if copy_from_active else {}
+        tree_expanded = current.tree_expanded if copy_from_active else {}
         view = ViewState.create(
             name,
             expanded=expanded,
             collapsed_sizes=collapsed_sizes,
+            visible=visible,
+            tree_expanded=tree_expanded,
         )
         self.views.append(view)
         self.active_view_id = view.id
@@ -508,6 +542,18 @@ class Workspace:
     def set_collapsed_size(self, element_id: str, width: float, height: float) -> None:
         self.diagram.current_view().set_collapsed_size(element_id, width, height)
 
+    def is_element_checked(self, element_id: str) -> bool:
+        return self.diagram.current_view().is_element_visible(element_id)
+
+    def set_element_checked(self, element_id: str, visible: bool) -> None:
+        self.diagram.current_view().set_element_visible(element_id, visible)
+
+    def is_tree_expanded(self, element_id: str) -> bool:
+        return self.diagram.current_view().is_tree_expanded(element_id)
+
+    def set_tree_expanded(self, element_id: str, expanded: bool) -> None:
+        self.diagram.current_view().set_tree_expanded(element_id, expanded)
+
     def add_view(self, name: str) -> ViewState:
         return self.diagram.add_view(name)
 
@@ -666,10 +712,20 @@ class Workspace:
         return ancestors
 
     def is_visible(self, element_id: str) -> bool:
+        if not self.is_available_in_view(element_id):
+            return False
         for ancestor in self.ancestors_of(element_id):
             if not self.is_expanded(ancestor.id):
                 return False
         return True
+
+    def is_available_in_view(self, element_id: str) -> bool:
+        if not self.is_element_checked(element_id):
+            return False
+        return all(
+            self.is_element_checked(ancestor.id)
+            for ancestor in self.ancestors_of(element_id)
+        )
 
     def visible_elements(self) -> list[C4Element]:
         return [
@@ -691,6 +747,11 @@ class Workspace:
     def visible_relationships(self) -> list[Relationship]:
         grouped: dict[tuple[str, str], Relationship] = {}
         for relationship in self.relationships.values():
+            if (
+                not self.is_available_in_view(relationship.source_id)
+                or not self.is_available_in_view(relationship.target_id)
+            ):
+                continue
             source_id = self.visible_endpoint_for(relationship.source_id)
             target_id = self.visible_endpoint_for(relationship.target_id)
             if source_id == target_id:

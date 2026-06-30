@@ -56,14 +56,19 @@ relationships, layouts, and views.
 
 Each model can also have multiple views. Views share the same elements and
 relationships within that model, but each view has its own expand/collapse
-state and collapsed sizes. This allows the same model to be shown at different
-levels of detail.
+state, model-tree visibility checkboxes, tree branch expansion state, and
+collapsed sizes. This allows the same model to be shown at different levels of
+detail.
 
 The Copy Model button duplicates the active model into a new independent model.
 Changes made to the copy do not affect the original.
 
 ## Diagram Behaviour
 
+- The left model tree shows the nested model structure for the active model.
+- Each model tree item has a checkbox that controls whether that element is
+  visible in the active view.
+- Tree branches can be expanded or collapsed independently in each view.
 - Elements can be moved and resized with the mouse.
 - Nested elements are constrained to stay inside their parent.
 - Parent boundaries grow as needed to keep their children contained.

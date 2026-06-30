@@ -234,6 +234,12 @@ Each view stores the presentation choices for the same underlying model:
       "width": 220.0,
       "height": 90.0
     }
+  },
+  "visible": {
+    "el_123abc": true
+  },
+  "tree_expanded": {
+    "el_123abc": true
   }
 }
 ```
@@ -244,9 +250,18 @@ Fields:
 - `name`: view tab label.
 - `expanded`: element ID to expansion state.
 - `collapsed_sizes`: element ID to view-specific collapsed bounds.
+- `visible`: element ID to model-tree checkbox state. Missing entries default
+  to `true`.
+- `tree_expanded`: element ID to left-tree branch expansion state. Missing
+  entries default to `true`.
 
 Views do not own elements or relationships. They only describe how the active
 model should be presented.
+
+Unchecked elements are hidden from the canvas in that view. If a parent is
+unchecked, its descendants are also hidden on the canvas even if their own
+checkboxes are checked. Relationships involving unchecked elements are not
+rendered in that view.
 
 ## Example Skeleton
 
@@ -318,7 +333,9 @@ elements, and one relationship:
             "expanded": {
               "el_shop": false
             },
-            "collapsed_sizes": {}
+            "collapsed_sizes": {},
+            "visible": {},
+            "tree_expanded": {}
           }
         ],
         "active_view_id": "view_default"
