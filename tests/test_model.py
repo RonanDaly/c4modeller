@@ -127,6 +127,28 @@ class WorkspaceVisibilityTests(unittest.TestCase):
         restored.set_active_model(first_model_id)
         self.assertEqual(restored.elements[first_system.id].name, "Payments")
 
+    def test_can_rename_active_model_and_view(self) -> None:
+        workspace = Workspace()
+
+        workspace.rename_active_model("Target Architecture")
+        workspace.rename_active_view("System Context")
+
+        self.assertEqual(workspace.current_model().name, "Target Architecture")
+        self.assertEqual(workspace.active_view().name, "System Context")
+
+        restored = Workspace.from_json(workspace.to_json())
+        self.assertEqual(restored.current_model().name, "Target Architecture")
+        self.assertEqual(restored.active_view().name, "System Context")
+
+    def test_rejects_blank_model_and_view_names(self) -> None:
+        workspace = Workspace()
+
+        with self.assertRaises(ValueError):
+            workspace.rename_active_model(" ")
+
+        with self.assertRaises(ValueError):
+            workspace.rename_active_view("")
+
     def test_systems_and_containers_are_collapsed_by_default(self) -> None:
         workspace = Workspace()
         system = workspace.add_element("Payments", ElementType.SOFTWARE_SYSTEM)

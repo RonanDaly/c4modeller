@@ -63,6 +63,9 @@ detail.
 The Copy Model button duplicates the active model into a new independent model.
 Changes made to the copy do not affect the original.
 
+Model and view names can be edited with the toolbar buttons or by double-clicking
+their tabs.
+
 ## Diagram Behaviour
 
 - The left model tree shows the nested model structure for the active model.

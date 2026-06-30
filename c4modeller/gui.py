@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+from heapq import heappop, heappush
+from itertools import count
 from pathlib import Path
 
 from PySide6.QtCore import QLineF, QMarginsF, QPointF, QRectF, Qt
@@ -91,6 +93,9 @@ LEAF_SUMMARY_TYPES = {
 }
 CONTAINMENT_MARGIN = 18.0
 CONTAINMENT_TOP_MARGIN = 54.0
+ROUTE_MARGIN = 24.0
+ROUTE_OUTLET = 18.0
+ROUTE_BEND_PENALTY = 30.0
 
 
 class ElementItem(QGraphicsRectItem):
@@ -385,6 +390,7 @@ class RelationshipItem:
         target: ElementItem,
         relationship_id: str,
         label: str,
+        obstacles: list[QRectF] | None = None,
     ) -> None:
         self.relationship_id = relationship_id
         self.path_item = RelationshipPathItem()
@@ -402,7 +408,7 @@ class RelationshipItem:
             item.setFlag(QGraphicsItem.ItemIsSelectable, True)
             item.setData(0, "relationship")
             item.setData(1, relationship_id)
-        self.update(source, target)
+        self.update(source, target, obstacles or [])
 
     def add_to_scene(self, scene: QGraphicsScene) -> None:
         scene.addItem(self.path_item)
@@ -415,24 +421,23 @@ class RelationshipItem:
             if item.scene() is scene:
                 scene.removeItem(item)
 
-    def update(self, source: ElementItem, target: ElementItem) -> None:
+    def update(
+        self,
+        source: ElementItem,
+        target: ElementItem,
+        obstacles: list[QRectF] | None = None,
+    ) -> None:
         source_rect = source.mapRectToScene(source.rect())
         target_rect = target.mapRectToScene(target.rect())
-        start, end, orientation = connection_points(source_rect, target_rect)
-        path = QPainterPath(start)
-        if orientation == "horizontal":
-            mid_x = (start.x() + end.x()) / 2
-            before_end = QPointF(mid_x, end.y())
-            path.lineTo(QPointF(mid_x, start.y()))
-            path.lineTo(before_end)
-            label_position = QPointF(mid_x + 6, (start.y() + end.y()) / 2 - 18)
-        else:
-            mid_y = (start.y() + end.y()) / 2
-            before_end = QPointF(end.x(), mid_y)
-            path.lineTo(QPointF(start.x(), mid_y))
-            path.lineTo(before_end)
-            label_position = QPointF((start.x() + end.x()) / 2 + 6, mid_y - 18)
-        path.lineTo(end)
+        points = route_orthogonal_path(source_rect, target_rect, obstacles or [])
+        if points is None:
+            points = fallback_route_points(source_rect, target_rect)
+        end = points[-1]
+        path = QPainterPath(points[0])
+        for point in points[1:]:
+            path.lineTo(point)
+        before_end = points[-2] if len(points) > 1 else points[0]
+        label_position = label_position_for_path(points)
         self.path_item.setPath(path)
         self.arrow_item.setPolygon(arrow_head(start=before_end, end=end))
         self.label_item.setPos(label_position)
@@ -636,9 +641,11 @@ class MainWindow(QMainWindow):
         self.model_tabs = QTabBar(self)
         self.model_tabs.setExpanding(False)
         self.model_tabs.currentChanged.connect(self.switch_model)
+        self.model_tabs.tabBarDoubleClicked.connect(self.edit_model_at_index)
         self.tabs = QTabBar(self)
         self.tabs.setExpanding(False)
         self.tabs.currentChanged.connect(self.switch_view)
+        self.tabs.tabBarDoubleClicked.connect(self.edit_view_at_index)
         self.model_tree = QTreeWidget(self)
         self.model_tree.setHeaderLabel("Model Elements")
         self.model_tree.setMinimumWidth(260)
@@ -703,7 +710,23 @@ class MainWindow(QMainWindow):
             target = self.element_items.get(relationship.target_id)
             if not source or not target:
                 continue
-            item = RelationshipItem(source, target, relationship.id, relationship.description)
+            obstacles = [
+                item.mapRectToScene(item.rect())
+                for element_id, item in self.element_items.items()
+                if element_id
+                in relationship_obstacle_ids(
+                    self.workspace,
+                    relationship.source_id,
+                    relationship.target_id,
+                )
+            ]
+            item = RelationshipItem(
+                source,
+                target,
+                relationship.id,
+                relationship.description,
+                obstacles,
+            )
             item.add_to_scene(self.scene)
             self.relationship_items.append(item)
 
@@ -1021,7 +1044,9 @@ class MainWindow(QMainWindow):
             ("Save As", self.save_workspace_as),
             ("Export PDF", self.export_active_view_pdf),
             ("Copy Model", self.copy_model),
+            ("Edit Model", self.edit_active_model_name),
             ("New View", self.new_view),
+            ("Edit View", self.edit_active_view_name),
             ("Delete View", self.delete_view),
             ("Add Person", lambda: self.add_element(ElementType.PERSON)),
             (
@@ -1073,10 +1098,29 @@ class MainWindow(QMainWindow):
         self.workspace.set_active_model(self.workspace.models[index].id)
         self.refresh_scene()
 
+    def edit_model_at_index(self, index: int) -> None:
+        if index < 0 or index >= len(self.workspace.models):
+            return
+        self.workspace.set_active_model(self.workspace.models[index].id)
+        self.edit_active_model_name()
+
     def copy_model(self) -> None:
         copied = self.workspace.copy_active_model()
         self.refresh_scene()
         self.statusBar().showMessage(f"Copied model to {copied.name}", 3000)
+
+    def edit_active_model_name(self) -> None:
+        model = self.workspace.current_model()
+        name, ok = QInputDialog.getText(
+            self,
+            "Edit Model",
+            "Name:",
+            text=model.name,
+        )
+        if not ok or not name.strip():
+            return
+        self.workspace.rename_active_model(name)
+        self.refresh_scene()
 
     def refresh_model_tree(self) -> None:
         self.syncing_model_tree = True
@@ -1168,6 +1212,12 @@ class MainWindow(QMainWindow):
         self.workspace.set_active_view(self.workspace.diagram.views[index].id)
         self.refresh_scene()
 
+    def edit_view_at_index(self, index: int) -> None:
+        if index < 0 or index >= len(self.workspace.diagram.views):
+            return
+        self.workspace.set_active_view(self.workspace.diagram.views[index].id)
+        self.edit_active_view_name()
+
     def new_view(self) -> None:
         default_name = f"View {len(self.workspace.diagram.views) + 1}"
         name, ok = QInputDialog.getText(
@@ -1179,6 +1229,19 @@ class MainWindow(QMainWindow):
         if not ok or not name.strip():
             return
         self.workspace.add_view(name.strip())
+        self.refresh_scene()
+
+    def edit_active_view_name(self) -> None:
+        view = self.workspace.active_view()
+        name, ok = QInputDialog.getText(
+            self,
+            "Edit View",
+            "Name:",
+            text=view.name,
+        )
+        if not ok or not name.strip():
+            return
+        self.workspace.rename_active_view(name)
         self.refresh_scene()
 
     def delete_view(self) -> None:
@@ -1486,6 +1549,268 @@ def connection_points(source: QRectF, target: QRectF) -> tuple[QPointF, QPointF,
             target.top() if dy > 0 else target.bottom(),
         )
     return source_point, target_point, orientation
+
+
+def relationship_obstacle_ids(
+    workspace: Workspace,
+    source_id: str,
+    target_id: str,
+) -> set[str]:
+    excluded = {source_id, target_id}
+    excluded.update(ancestor.id for ancestor in workspace.ancestors_of(source_id))
+    excluded.update(ancestor.id for ancestor in workspace.ancestors_of(target_id))
+    return {
+        element.id
+        for element in workspace.visible_elements()
+        if element.id not in excluded
+    }
+
+
+def route_orthogonal_path(
+    source: QRectF,
+    target: QRectF,
+    obstacles: list[QRectF],
+) -> list[QPointF] | None:
+    keepouts = [
+        source.adjusted(-1, -1, 1, 1),
+        target.adjusted(-1, -1, 1, 1),
+    ]
+    keepouts.extend(
+        obstacle.adjusted(-ROUTE_MARGIN, -ROUTE_MARGIN, ROUTE_MARGIN, ROUTE_MARGIN)
+        for obstacle in obstacles
+    )
+    best_path: list[QPointF] | None = None
+    best_score = math.inf
+    for source_side in ["left", "right", "top", "bottom"]:
+        source_anchor, source_outlet = side_anchor_and_outlet(source, source_side)
+        for target_side in ["left", "right", "top", "bottom"]:
+            target_anchor, target_outlet = side_anchor_and_outlet(target, target_side)
+            routed = orthogonal_grid_route(source_outlet, target_outlet, keepouts)
+            if routed is None:
+                continue
+            path = simplify_path([source_anchor, *routed, target_anchor])
+            score = route_score(path)
+            if score < best_score:
+                best_score = score
+                best_path = path
+    return best_path
+
+
+def side_anchor_and_outlet(rect: QRectF, side: str) -> tuple[QPointF, QPointF]:
+    center = rect.center()
+    if side == "left":
+        anchor = QPointF(rect.left(), center.y())
+        outlet = QPointF(rect.left() - ROUTE_OUTLET, center.y())
+    elif side == "right":
+        anchor = QPointF(rect.right(), center.y())
+        outlet = QPointF(rect.right() + ROUTE_OUTLET, center.y())
+    elif side == "top":
+        anchor = QPointF(center.x(), rect.top())
+        outlet = QPointF(center.x(), rect.top() - ROUTE_OUTLET)
+    else:
+        anchor = QPointF(center.x(), rect.bottom())
+        outlet = QPointF(center.x(), rect.bottom() + ROUTE_OUTLET)
+    return anchor, outlet
+
+
+def orthogonal_grid_route(
+    start: QPointF,
+    end: QPointF,
+    keepouts: list[QRectF],
+) -> list[QPointF] | None:
+    if point_inside_any_keepout(start, keepouts) or point_inside_any_keepout(end, keepouts):
+        return None
+    x_values = {start.x(), end.x()}
+    y_values = {start.y(), end.y()}
+    for rect in keepouts:
+        x_values.update([rect.left(), rect.right()])
+        y_values.update([rect.top(), rect.bottom()])
+    xs = sorted(x_values)
+    ys = sorted(y_values)
+    valid_nodes = {
+        (x, y)
+        for x in xs
+        for y in ys
+        if not point_inside_any_keepout(QPointF(x, y), keepouts)
+    }
+    start_key = (start.x(), start.y())
+    end_key = (end.x(), end.y())
+    valid_nodes.update([start_key, end_key])
+
+    distances: dict[tuple[tuple[float, float], str | None], float] = {
+        (start_key, None): 0.0
+    }
+    paths: dict[tuple[tuple[float, float], str | None], list[tuple[float, float]]] = {
+        (start_key, None): [start_key]
+    }
+    tie_breaker = count()
+    queue: list[tuple[float, int, tuple[float, float], str | None]] = [
+        (0.0, next(tie_breaker), start_key, None)
+    ]
+    while queue:
+        cost, _, node, previous_direction = heappop(queue)
+        state = (node, previous_direction)
+        if cost > distances.get(state, math.inf):
+            continue
+        if node == end_key:
+            return [QPointF(x, y) for x, y in simplify_point_keys(paths[state])]
+        for neighbour, direction in grid_neighbours(node, xs, ys, valid_nodes, keepouts):
+            move_cost = abs(neighbour[0] - node[0]) + abs(neighbour[1] - node[1])
+            bend_cost = (
+                ROUTE_BEND_PENALTY
+                if previous_direction and previous_direction != direction
+                else 0.0
+            )
+            next_cost = cost + move_cost + bend_cost
+            next_state = (neighbour, direction)
+            if next_cost >= distances.get(next_state, math.inf):
+                continue
+            distances[next_state] = next_cost
+            paths[next_state] = [*paths[state], neighbour]
+            heappush(queue, (next_cost, next(tie_breaker), neighbour, direction))
+    return None
+
+
+def grid_neighbours(
+    node: tuple[float, float],
+    xs: list[float],
+    ys: list[float],
+    valid_nodes: set[tuple[float, float]],
+    keepouts: list[QRectF],
+) -> list[tuple[tuple[float, float], str]]:
+    x, y = node
+    neighbours: list[tuple[tuple[float, float], str]] = []
+    x_index = xs.index(x)
+    y_index = ys.index(y)
+    for next_x in [xs[index] for index in [x_index - 1, x_index + 1] if 0 <= index < len(xs)]:
+        candidate = (next_x, y)
+        if candidate in valid_nodes and not segment_crosses_any_keepout(node, candidate, keepouts):
+            neighbours.append((candidate, "horizontal"))
+    for next_y in [ys[index] for index in [y_index - 1, y_index + 1] if 0 <= index < len(ys)]:
+        candidate = (x, next_y)
+        if candidate in valid_nodes and not segment_crosses_any_keepout(node, candidate, keepouts):
+            neighbours.append((candidate, "vertical"))
+    return neighbours
+
+
+def point_inside_any_keepout(point: QPointF, keepouts: list[QRectF]) -> bool:
+    return any(
+        rect.left() < point.x() < rect.right()
+        and rect.top() < point.y() < rect.bottom()
+        for rect in keepouts
+    )
+
+
+def segment_crosses_any_keepout(
+    start: tuple[float, float],
+    end: tuple[float, float],
+    keepouts: list[QRectF],
+) -> bool:
+    return any(segment_crosses_rect(start, end, rect) for rect in keepouts)
+
+
+def segment_crosses_rect(
+    start: tuple[float, float],
+    end: tuple[float, float],
+    rect: QRectF,
+) -> bool:
+    x1, y1 = start
+    x2, y2 = end
+    if x1 == x2 and y1 == y2:
+        return False
+    if y1 == y2:
+        left = min(x1, x2)
+        right = max(x1, x2)
+        return rect.top() < y1 < rect.bottom() and left < rect.right() and right > rect.left()
+    if x1 == x2:
+        top = min(y1, y2)
+        bottom = max(y1, y2)
+        return rect.left() < x1 < rect.right() and top < rect.bottom() and bottom > rect.top()
+    return False
+
+
+def fallback_route_points(source: QRectF, target: QRectF) -> list[QPointF]:
+    start, end, orientation = connection_points(source, target)
+    if orientation == "horizontal":
+        mid_x = (start.x() + end.x()) / 2
+        points = [
+            start,
+            QPointF(mid_x, start.y()),
+            QPointF(mid_x, end.y()),
+            end,
+        ]
+    else:
+        mid_y = (start.y() + end.y()) / 2
+        points = [
+            start,
+            QPointF(start.x(), mid_y),
+            QPointF(end.x(), mid_y),
+            end,
+        ]
+    return simplify_path(points)
+
+
+def simplify_path(points: list[QPointF]) -> list[QPointF]:
+    keys = simplify_point_keys([(point.x(), point.y()) for point in points])
+    return [QPointF(x, y) for x, y in keys]
+
+
+def simplify_point_keys(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    deduped: list[tuple[float, float]] = []
+    for point in points:
+        if not deduped or point != deduped[-1]:
+            deduped.append(point)
+    if len(deduped) <= 2:
+        return deduped
+    simplified = [deduped[0]]
+    for index in range(1, len(deduped) - 1):
+        previous = simplified[-1]
+        current = deduped[index]
+        next_point = deduped[index + 1]
+        if (
+            previous[0] == current[0] == next_point[0]
+            or previous[1] == current[1] == next_point[1]
+        ):
+            continue
+        simplified.append(current)
+    simplified.append(deduped[-1])
+    return simplified
+
+
+def route_score(points: list[QPointF]) -> float:
+    length = 0.0
+    bends = 0
+    previous_direction: str | None = None
+    for start, end in zip(points, points[1:]):
+        length += abs(end.x() - start.x()) + abs(end.y() - start.y())
+        direction = "horizontal" if start.y() == end.y() else "vertical"
+        if previous_direction and previous_direction != direction:
+            bends += 1
+        previous_direction = direction
+    return length + bends * ROUTE_BEND_PENALTY
+
+
+def label_position_for_path(points: list[QPointF]) -> QPointF:
+    if len(points) == 1:
+        return QPointF(points[0].x() + 6, points[0].y() - 18)
+    total_length = sum(
+        abs(end.x() - start.x()) + abs(end.y() - start.y())
+        for start, end in zip(points, points[1:])
+    )
+    halfway = total_length / 2
+    travelled = 0.0
+    for start, end in zip(points, points[1:]):
+        segment_length = abs(end.x() - start.x()) + abs(end.y() - start.y())
+        if travelled + segment_length >= halfway:
+            if segment_length == 0:
+                return QPointF(start.x() + 6, start.y() - 18)
+            ratio = (halfway - travelled) / segment_length
+            return QPointF(
+                start.x() + (end.x() - start.x()) * ratio + 6,
+                start.y() + (end.y() - start.y()) * ratio - 18,
+            )
+        travelled += segment_length
+    return QPointF(points[-1].x() + 6, points[-1].y() - 18)
 
 
 def arrow_head(start: QPointF, end: QPointF) -> QPolygonF:

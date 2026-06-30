@@ -497,6 +497,12 @@ class Workspace:
             raise KeyError(f"Unknown model: {model_id}")
         self.active_model_id = model_id
 
+    def rename_active_model(self, name: str) -> None:
+        name = name.strip()
+        if not name:
+            raise ValueError("Model name cannot be empty")
+        self.current_model().name = name
+
     def copy_active_model(self) -> C4Model:
         current = self.current_model()
         base_name = current.name
@@ -567,6 +573,12 @@ class Workspace:
 
     def active_view(self) -> ViewState:
         return self.diagram.current_view()
+
+    def rename_active_view(self, name: str) -> None:
+        name = name.strip()
+        if not name:
+            raise ValueError("View name cannot be empty")
+        self.active_view().name = name
 
     def view_index(self) -> int:
         active_id = self.diagram.active_view_id
