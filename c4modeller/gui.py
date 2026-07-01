@@ -726,6 +726,11 @@ class MainWindow(QMainWindow):
         self.refresh_model_tabs()
         self.refresh_tabs()
         self.refresh_model_tree()
+        self.refresh_canvas(enforce_containment=False)
+
+    def refresh_canvas(self, enforce_containment: bool = True) -> None:
+        if enforce_containment:
+            self.enforce_containment()
         self.scene.clear()
         self.element_items.clear()
         self.relationship_items.clear()
@@ -1241,7 +1246,7 @@ class MainWindow(QMainWindow):
             element_id,
             item.checkState(0) == Qt.Checked,
         )
-        self.refresh_scene()
+        self.refresh_canvas()
 
     def handle_model_tree_item_expanded(self, item: QTreeWidgetItem) -> None:
         self._set_model_tree_item_expanded(item, True)
